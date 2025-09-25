@@ -9,6 +9,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/sched/task_stack.h>
+#include <linux/kthread.h>
 
 #include "objsec.h"
 #include "allowlist.h"
@@ -230,6 +231,116 @@ int __ksu_handle_devpts(struct inode *inode)
 	return 0;
 }
 
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// every little bit helps here
+__attribute__((hot, no_stack_protector))
+static __always_inline bool is_su_allowed(const void *ptr_to_check)
+{
+	barrier();
+	if (likely(!ksu_is_allow_uid(current_uid().val)))
+		return false;
+
+	if (unlikely(!ptr_to_check))
+		return false;
+
+	return true;
+}
+
+static int ksu_sucompat_kernel_common(void *filename_ptr, const char *function_name, bool escalate)
+{
+
+	if (likely(memcmp(filename_ptr, SU_PATH, sizeof(SU_PATH))))
+		return 0;
+
+	if (escalate) {
+		pr_info("%s su found\n", function_name);
+		memcpy(filename_ptr, KSUD_PATH, sizeof(KSUD_PATH));
+		escape_to_root();
+	} else {
+		pr_info("%s su->sh\n", function_name);
+		memcpy(filename_ptr, SH_PATH, sizeof(SH_PATH));
+	}
+	return 0;
+}
+
+static int ksu_getname_flags_kernel(char **kname, int flags)
+{
+	if (!is_su_allowed((const void *)kname))
+		return 0;
+
+	return ksu_sucompat_kernel_common((void *)*kname, "getname_flags", !!!flags);
+}
+
+struct kretprobe *getname_rp;
+
+static int getname_flags_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	int *flags = (int *)ri->data;
+
+	struct filename *ret = (struct filename *)PT_REGS_RC(regs);
+	if (IS_ERR(ret) || !ret || !ret->name)
+		return 0;
+
+	ksu_getname_flags_kernel((char **)&ret->name, *flags);
+	return 0;
+}
+
+static int getname_flags_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	int *flags = (int *)ri->data; // as per sample, we store everything on ri->data ?
+	*flags = (int)PT_REGS_PARM2(regs); // keep a copy of arg2
+
+	return 0;
+}
+
+static struct kretprobe *init_kretprobe(const char *symbol,
+					kretprobe_handler_t entry_handler,
+					kretprobe_handler_t ret_handler,
+					size_t data_size,
+					int maxactive)
+{
+	struct kretprobe *rp = kzalloc(sizeof(struct kretprobe), GFP_KERNEL);
+	if (!rp)
+		return NULL;
+
+	rp->kp.symbol_name = symbol;
+	rp->entry_handler = entry_handler;
+	rp->handler = ret_handler;
+	rp->data_size = data_size;
+	rp->maxactive = maxactive;
+
+	int ret = register_kretprobe(rp);
+	if (ret) {
+		kfree(rp);
+		return NULL;
+	}
+	pr_info("rp_sucompat: planted kretprobe at %s: %p\n", rp->kp.symbol_name, rp->kp.addr);
+
+	return rp;
+}
+
+static void destroy_kretprobe(struct kretprobe **rp_ptr)
+{
+	if (!rp_ptr || !*rp_ptr)
+		return;
+
+	unregister_kretprobe(*rp_ptr);
+	kfree(*rp_ptr);
+	*rp_ptr = NULL;
+}
+
+static struct task_struct *unregister_thread;
+
+static int kp_sucompat_exit_fn(void *data)
+{
+	pr_info("rp_sucompat: unregister getname_flags!\n");
+	destroy_kretprobe(&getname_rp);
+	return 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 #ifdef CONFIG_KSU_KPROBES_HOOK
 static int faccessat_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -313,10 +424,9 @@ static void destroy_kprobe(struct kprobe **kp_ptr)
 void ksu_sucompat_init()
 {
 #ifdef CONFIG_KSU_KPROBES_HOOK
-	su_kps[0] = init_kprobe(SYS_EXECVE_SYMBOL, execve_handler_pre);
-	su_kps[1] = init_kprobe(SYS_FACCESSAT_SYMBOL, faccessat_handler_pre);
-	su_kps[2] = init_kprobe(SYS_NEWFSTATAT_SYMBOL, newfstatat_handler_pre);
-	su_kps[3] = init_kprobe("pts_unix98_lookup", pts_unix98_lookup_pre);
+	pr_info("%s: register getname_flags!\n", __func__);
+	getname_rp = init_kretprobe("getname_flags", getname_flags_entry_handler,
+			getname_flags_ret_handler, sizeof(int), 20);
 #else
 	ksu_sucompat_hook_state = true;
  	pr_info("ksu_sucompat_init: hooks enabled: execve/execveat_su, faccessat, stat\n");
@@ -326,9 +436,10 @@ void ksu_sucompat_init()
 void ksu_sucompat_exit()
 {
 #ifdef CONFIG_KSU_KPROBES_HOOK
-	int i;
-	for (i = 0; i < ARRAY_SIZE(su_kps); i++) {
-		destroy_kprobe(&su_kps[i]);
+	unregister_thread = kthread_run(kp_sucompat_exit_fn, NULL, "kprobe_unregister");
+	if (IS_ERR(unregister_thread)) {
+		unregister_thread = NULL;
+		return;
 	}
 #else
 	ksu_sucompat_hook_state = false;
